@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse, quote, unquote
 
 from notion_client import Client as NotionClient
-from notion_client.errors import APIResponseError
+from notion_client.errors import APIResponseError, HTTPResponseError
 
 # Configure logging
 logging.basicConfig(
@@ -929,25 +929,50 @@ class NotionMigrator:
             logger.error(f"Failed to create page '{title}': {e}")
             raise
     
-    def add_blocks(self, page_id: str, blocks: list):
+    def add_blocks(self, page_id: str, blocks: list, max_retries: int = 3) -> bool:
+        """Add blocks to a page. Returns True on success, False on failure."""
         if self.config.dry_run:
             logger.info(f"[DRY RUN] Would add {len(blocks)} blocks")
-            return
-        
+            return True
+
         if not blocks:
-            return
-        
+            return True
+
         for i in range(0, len(blocks), 100):
             batch = blocks[i:i+100]
-            try:
-                self.client.blocks.children.append(block_id=page_id, children=batch)
-                if i + 100 < len(blocks):
-                    time.sleep(0.3)
-            except APIResponseError as e:
-                logger.error(f"Failed to add blocks: {e}")
-                raise
-        
+            success = False
+            last_error = None
+
+            for attempt in range(max_retries):
+                try:
+                    self.client.blocks.children.append(block_id=page_id, children=batch)
+                    success = True
+                    break
+                except (APIResponseError, HTTPResponseError) as e:
+                    last_error = e
+                    status = getattr(e, 'status', None) or getattr(getattr(e, 'response', None), 'status_code', None)
+                    # Retry on transient errors (502, 503, 504, 429)
+                    if status in (502, 503, 504, 429):
+                        wait_time = (attempt + 1) * 2  # Exponential backoff: 2, 4, 6 seconds
+                        logger.warning(f"Transient error ({status}), retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(wait_time)
+                    else:
+                        # Non-retryable error
+                        logger.error(f"Failed to add blocks: {e}")
+                        return False
+                except Exception as e:
+                    logger.error(f"Unexpected error adding blocks: {e}")
+                    return False
+
+            if not success:
+                logger.error(f"Failed to add blocks after {max_retries} retries: {last_error}")
+                return False
+
+            if i + 100 < len(blocks):
+                time.sleep(0.3)
+
         logger.debug(f"Added {len(blocks)} blocks to page")
+        return True
 
 
 # =============================================================================
@@ -986,7 +1011,7 @@ class MigrationOrchestrator:
         self.uploader = NotionFileUploader(config.notion_token, config)
         self.block_builder = NotionBlockBuilder(self.uploader)
 
-        self.stats = {"directories": 0, "notes": 0, "files_referenced": 0, "files_orphaned": 0, "errors": 0}
+        self.stats = {"directories": 0, "notes": 0, "files_referenced": 0, "files_orphaned": 0, "errors": 0, "api_errors": 0}
 
         # Track all files for complete accounting
         self.all_vault_files = []  # All non-md files found in vault
@@ -994,6 +1019,7 @@ class MigrationOrchestrator:
         self.skipped_files = []  # Files in skipped directories
         self.orphaned_files = []  # Files uploaded as orphans
         self.dir_page_ids = {}  # Map directory paths to their Notion page IDs
+        self.api_errors = []  # Track API errors for reporting
 
         # Generate unique report prefix based on input directory and timestamp
         self.report_prefix = self._generate_report_prefix()
@@ -1040,6 +1066,8 @@ class MigrationOrchestrator:
         logger.info(f"Files (skipped):   {len(self.skipped_files)}")
         if self.stats['errors'] > 0:
             logger.warning(f"Errors:            {self.stats['errors']}")
+        if self.stats['api_errors'] > 0:
+            logger.warning(f"API errors:        {self.stats['api_errors']}")
         logger.info("=" * 60)
 
         # Write report of all files
@@ -1057,7 +1085,7 @@ class MigrationOrchestrator:
         self._write_csv_report(successful_uploads, failed_uploads, unresolved)
 
         # Write text report if there were failures
-        if not failed_uploads and not unresolved:
+        if not failed_uploads and not unresolved and not self.api_errors:
             return
 
         report_path = Path(f"{self.report_prefix}-failed_files.txt")
@@ -1083,9 +1111,22 @@ class MigrationOrchestrator:
                     f.write(f"  File: {item['file']}\n")
                     f.write(f"  Reason: {item['reason']}\n\n")
 
+            if self.api_errors:
+                f.write(f"\nAPI ERRORS ({len(self.api_errors)})\n")
+                f.write("-" * 40 + "\n")
+                f.write("These items had transient API errors (502, 503, etc.):\n\n")
+                for item in self.api_errors:
+                    f.write(f"  Type: {item['type']}\n")
+                    f.write(f"  File: {item['file']}\n")
+                    f.write(f"  Reason: {item['reason']}\n")
+                    if item.get('page_id'):
+                        f.write(f"  Page ID: {item['page_id']}\n")
+                    f.write("\n")
+
         logger.info(f"Failure report written to: {report_path}")
         logger.warning(f"  - {len(unresolved)} unresolved file references")
         logger.warning(f"  - {len(failed_uploads)} failed uploads")
+        logger.warning(f"  - {len(self.api_errors)} API errors")
 
     def _write_csv_report(self, successful: list, failed: list, unresolved: list):
         """Write a CSV report of all file upload statuses."""
@@ -1161,6 +1202,19 @@ class MigrationOrchestrator:
                     '',
                     'File not found in vault',
                     item.get('note', '')
+                ])
+
+            # API errors (transient failures like 502)
+            for item in self.api_errors:
+                writer.writerow([
+                    item.get('file', ''),
+                    item.get('name', ''),
+                    'api_error',
+                    item.get('type', 'unknown'),
+                    item.get('page_id', ''),
+                    '',
+                    item.get('reason', ''),
+                    ''
                 ])
 
         # Calculate totals for verification
@@ -1287,7 +1341,16 @@ class MigrationOrchestrator:
             self.stats["files_referenced"] += len(parsed.file_references)
 
             if blocks:
-                self.notion.add_blocks(note_page_id, blocks)
+                if not self.notion.add_blocks(note_page_id, blocks):
+                    logger.warning(f"{'  ' * depth}⚠️  Content partially failed for: {note_path.name}")
+                    self.api_errors.append({
+                        'type': 'note_content',
+                        'file': str(note_path),
+                        'name': note_path.name,
+                        'page_id': note_page_id,
+                        'reason': 'Failed to add blocks after retries'
+                    })
+                    self.stats["api_errors"] += 1
 
             self.stats["notes"] += 1
 
@@ -1339,14 +1402,21 @@ class MigrationOrchestrator:
                 # Create a file block in the parent page
                 file_block = self.block_builder._file_block(file_info)
                 if file_block:
-                    self.notion.add_blocks(parent_page_id, [file_block])
-                    self.orphaned_files.append({
-                        'file': str(file_path),
-                        'name': file_path.name,
-                        'status': 'uploaded',
-                        'parent_page_id': parent_page_id
-                    })
-                    self.stats["files_orphaned"] += 1
+                    if self.notion.add_blocks(parent_page_id, [file_block]):
+                        self.orphaned_files.append({
+                            'file': str(file_path),
+                            'name': file_path.name,
+                            'status': 'uploaded',
+                            'parent_page_id': parent_page_id
+                        })
+                        self.stats["files_orphaned"] += 1
+                    else:
+                        self.orphaned_files.append({
+                            'file': str(file_path),
+                            'name': file_path.name,
+                            'status': 'api_error',
+                            'parent_page_id': parent_page_id
+                        })
                 else:
                     self.orphaned_files.append({
                         'file': str(file_path),

@@ -1,7 +1,7 @@
 # Markdown Import Tool for Notion
 
 Migrate your markdown workspace to Notion with page hierarchy and embedded
-files.  For example, this could import an Obsidial Vault to Notion.
+files. For example, this could import an Obsidian Vault to Notion.
 
 Author: Ryan Cabeen, ryan@saturnatech.com
 
@@ -11,11 +11,13 @@ Author: Ryan Cabeen, ryan@saturnatech.com
 - Parses Obsidian-flavored markdown
 - Uploads files directly to Notion via the file upload API
 - Embeds images, PDFs, videos, and audio inline in notes
+- **Uploads all files** - both referenced files and orphaned files are captured
 - Converts markdown links `[text](url)` to clickable Notion links
 - Auto-fetches page titles for bare URLs
 - Extracts dates from `YYYY-MM-DD Title.md` filenames
-- Sorts in reverse order (newest first for timestamped notes)
-- Generates CSV report of all file upload statuses
+- Configurable sort order (alphabetical or reverse)
+- Resilient to transient API errors (retries with backoff)
+- Comprehensive reporting for verification
 - Dry-run mode to preview changes
 
 ## Quick Start
@@ -37,7 +39,7 @@ pip install notion-client requests
 ### 3. Share Target Page
 
 1. Open your destination page in Notion
-2. Click **⋯** → **Add connections** → Select your integration
+2. Click **...** → **Add connections** → Select your integration
 
 ### 4. Run
 
@@ -68,6 +70,7 @@ Options:
   --token TOKEN    Notion integration token (default: NOTION_TOKEN env var)
   --dry-run        Preview migration without making changes
   --skip-files     Skip file uploads (migrate notes only)
+  --reverse-sort   Sort in reverse alphabetical order (newest first for timestamped notes)
   --verbose, -v    Enable verbose logging
 ```
 
@@ -83,6 +86,9 @@ python migrate.py ~/Obsidian/MyVault/Projects "https://notion.so/abc123"
 # Preview what will happen
 python migrate.py ~/Obsidian/Work "https://notion.so/myteam/abc123" --dry-run
 
+# Reverse sort (newest/last items first - useful for journals)
+python migrate.py ~/Obsidian "https://notion.so/abc123" --reverse-sort
+
 # Skip file uploads (faster, notes only)
 python migrate.py ~/Obsidian "https://notion.so/abc123" --skip-files
 
@@ -97,8 +103,9 @@ The script works with **any directory structure**. It recursively processes all 
 ```
 AnyFolder/
 ├── Subfolder A/
-│   ├── files/              ← attachments (auto-skipped as folder)
-│   │   └── diagram.png
+│   ├── files/              ← attachments directory
+│   │   ├── diagram.png     ← referenced by note
+│   │   └── archive.zip     ← orphaned (uploaded to Subfolder A)
 │   ├── 2024-12-01 Note.md
 │   └── 2024-11-15 Note.md
 ├── Subfolder B/
@@ -106,15 +113,18 @@ AnyFolder/
 └── README.md
 ```
 
-**Auto-skipped directories:** `files/`, `.obsidian/`, `.git/`, `.trash/`, and any hidden folders (starting with `.`)
+**Skipped directories:** `.obsidian/`, `.git/`, `.trash/`, and any hidden folders (starting with `.`)
+
+**Attachment directories:** `files/` folders are scanned for files but not created as pages
 
 ## Result in Notion
 
 ```
 📁 Subfolder A
-│   ├── 📄 2024-12-01 Note      ← newest first
+│   ├── 📄 2024-12-01 Note
 │   │   └── [diagram.png embedded]
-│   └── 📄 2024-11-15 Note
+│   ├── 📄 2024-11-15 Note
+│   └── [archive.zip - orphaned file]
 📁 Subfolder B
 │   └── 📄 Overview
 📄 README
@@ -123,6 +133,16 @@ AnyFolder/
 Folders get contextual icons based on name (📓 Journal, 📋 Areas, 📚 Resources, etc.)
 
 ## File Handling
+
+### All Files Are Captured
+
+The script ensures **every file** in your vault is accounted for:
+
+1. **Referenced files**: Files embedded in markdown notes are uploaded to that note's page
+2. **Orphaned files**: Files not referenced by any note are uploaded to their parent directory's page
+3. **Skipped files**: Files in `.obsidian/`, `.git/`, etc. are tracked in the report but not uploaded
+
+This guarantees you can safely dispose of the original vault after verifying the migration report.
 
 ### Supported Embed Syntax
 
@@ -149,7 +169,7 @@ URL-encoded paths (e.g., `path%20with%20spaces`) are automatically decoded.
 - **Documents:** pdf, doc, docx, xls, xlsx, ppt, pptx, txt, csv, html
 - **Video:** mp4, mov, webm, avi, mkv
 - **Audio:** mp3, wav, ogg, m4a, flac
-- **Archives:** zip, tar, gz, rar, 7z
+- **Archives:** zip, tar, gz, rar, 7z (upload may fail - see Limitations)
 - **Code:** json, xml, yaml, yml, ipynb
 
 ## Link Handling
@@ -185,9 +205,9 @@ URL-encoded paths (e.g., `path%20with%20spaces`) are automatically decoded.
 
 ## Reports
 
-After migration, the script generates:
+After migration, the script generates timestamped reports:
 
-### `migration_files_report.csv`
+### `{vault}-{timestamp}-files_report.csv`
 
 CSV with every file's status:
 
@@ -195,23 +215,39 @@ CSV with every file's status:
 |--------|-------------|
 | `file_path` | Full path to source file |
 | `file_name` | Filename |
-| `status` | `uploaded`, `upload_failed`, or `not_found` |
+| `status` | `uploaded`, `upload_failed`, `skipped`, `api_error`, or `not_found` |
+| `category` | `referenced`, `orphaned`, `skipped`, or `unresolved_reference` |
 | `notion_page_id` | Notion page where file was uploaded |
 | `notion_file_id` | Notion file upload ID |
 | `error_reason` | Why it failed (if applicable) |
 | `referenced_from` | Which note referenced it |
 
-### `migration_failed_files.txt`
+The report includes totals for verification:
+- Total files found in vault
+- Total files in report (should match)
+
+### `{vault}-{timestamp}-failed_files.txt`
 
 Human-readable report of failures (only created if there were issues):
 
 - **Unresolved references:** Files mentioned in notes but not found
-- **Failed uploads:** Files found but couldn't be uploaded (with error details)
+- **Failed uploads:** Files found but couldn't be uploaded
+- **API errors:** Transient failures (502, 503, etc.) that persisted after retries
+
+## Error Handling
+
+The script is designed to be resilient:
+
+- **Transient API errors** (502, 503, 504, 429): Automatically retries up to 3 times with exponential backoff
+- **Failed uploads**: Logged and reported, but migration continues
+- **Missing files**: Tracked in report, migration continues
+
+This ensures a single failure doesn't stop the entire migration.
 
 ## Troubleshooting
 
 ### "Could not find integration"
-Share your destination page with the integration: **⋯** → **Add connections**
+Share your destination page with the integration: **...** → **Add connections**
 
 ### "401 Unauthorized"
 Check that your `NOTION_TOKEN` is correct
@@ -221,21 +257,43 @@ Some URLs in your notes may be malformed. Run with `-v` to see which URLs are be
 
 ### Files not appearing
 - Verify your Notion integration has **Read content** capability enabled
-- Check the `migration_files_report.csv` for specific errors
+- Check the CSV report for specific errors
 - Use `--verbose` to see detailed upload logs
 
 ### Files not found
-- Check `migration_failed_files.txt` for unresolved references
+- Check the failed files report for unresolved references
 - The script searches the entire directory tree as a fallback
 - Verify the file exists and the path/filename matches
 
 ### Rate limiting
 The script includes delays between API calls. For very large vaults, you may need to run in batches.
 
+### 502/503 errors
+These are transient Notion API errors. The script retries automatically. If they persist, wait and try again later.
+
 ## Limitations
 
-- **Internal links:** `[[Note Name]]` becomes plain text (Notion API limitation)
+### Not Supported
+
+- **Internal links:** `[[Note Name]]` becomes plain text (Notion API doesn't support creating cross-page links)
 - **Dataview queries:** Not converted (use Notion databases instead)
-- **Plugins:** Plugin-specific syntax won't transfer
-- **File size:** Notion has file size limits for API uploads 
-- **Inline files:** Files in Notion are block-level, so inline file links become separate blocks
+- **Obsidian plugins:** Plugin-specific syntax won't transfer
+- **Nested bullet points:** Flattened to single level
+- **Tables:** Not currently converted to Notion tables
+
+### Known Issues
+
+- **Archive files** (zip, tar, etc.): Notion's API may reject certain file types. These are tracked in the report for manual upload.
+- **Large files**: Notion has file size limits for API uploads (~5MB for most file types)
+- **Inline files**: Files in Notion are block-level, so inline file references become separate blocks
+
+### Not Implemented
+
+- **Resume capability**: If interrupted, migration must restart from the beginning
+- **Incremental sync**: Designed for one-time migration, not ongoing synchronization
+- **Content verification**: No checksum verification of uploaded files
+- **Progress indicator**: Logs show progress but no ETA or percentage
+
+## License
+
+MIT License - See LICENSE file for details.
