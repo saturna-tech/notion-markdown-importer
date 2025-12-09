@@ -113,7 +113,13 @@ Examples:
         action="store_true",
         help="Enable verbose logging"
     )
-    
+
+    parser.add_argument(
+        "--reverse-sort",
+        action="store_true",
+        help="Sort files in reverse alphabetical order (newest/last items appear first)"
+    )
+
     return parser.parse_args()
 
 
@@ -164,6 +170,7 @@ class Config:
     dry_run: bool = False
     skip_files: bool = False
     verbose: bool = False
+    reverse_sort: bool = False
 
 
 # =============================================================================
@@ -1112,12 +1119,12 @@ class MigrationOrchestrator:
 
     def _migrate_directory_contents(self, dir_path: Path, parent_id: str, depth: int):
         """Recursively migrate a directory's contents."""
-        # Get all subdirectories and markdown files (reverse order so newest/last appear first)
+        # Get all subdirectories and markdown files
         subdirs = sorted(
             [d for d in dir_path.iterdir() if d.is_dir() and not self._should_skip_dir(d)],
-            reverse=True
+            reverse=self.config.reverse_sort
         )
-        md_files = sorted(dir_path.glob("*.md"), reverse=True)
+        md_files = sorted(dir_path.glob("*.md"), reverse=self.config.reverse_sort)
 
         # Migrate subdirectories first (they become subpages)
         for subdir in subdirs:
@@ -1205,7 +1212,8 @@ def main():
         parent_page_id=parent_page_id,
         dry_run=args.dry_run,
         skip_files=args.skip_files,
-        verbose=args.verbose
+        verbose=args.verbose,
+        reverse_sort=args.reverse_sort
     )
     
     orchestrator = MigrationOrchestrator(config)
