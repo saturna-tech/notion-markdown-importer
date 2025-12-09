@@ -3,6 +3,8 @@
 Migrate your markdown workspace to Notion with page hierarchy and embedded
 files.  For example, this could import an Obsidial Vault to Notion.
 
+Author: Ryan Cabeen, ryan@saturnatech.com
+
 ## Features
 
 - Preserves any folder structure as nested Notion pages

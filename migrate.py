@@ -22,6 +22,8 @@ Setup:
     1. Create a Notion integration at https://www.notion.so/my-integrations
     2. Share your target Notion page/teamspace with the integration
     3. Set NOTION_TOKEN environment variable (or use --token flag)
+
+Author: Ryan Cabeen, ryan@saturnatech.com
 """
 
 import argparse
