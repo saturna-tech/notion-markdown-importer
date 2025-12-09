@@ -957,9 +957,6 @@ class NotionMigrator:
 class MigrationOrchestrator:
     """Orchestrates the full migration process."""
 
-    # Directory names to skip (attachment folders, hidden dirs)
-    SKIP_DIRS = {'files', '.obsidian', '.trash', '.git'}
-
     # Icons for common folder names
     FOLDER_ICONS = {
         "journal": "📓", "journals": "📓",
@@ -975,6 +972,11 @@ class MigrationOrchestrator:
         "weekly": "📆",
     }
 
+    # Directories to skip entirely (not migrated, but tracked in report)
+    SKIP_DIRS_REPORT = {'.obsidian', '.trash', '.git'}
+    # Directories that contain attachments (not created as pages, but files are processed)
+    ATTACHMENT_DIRS = {'files'}
+
     def __init__(self, config: Config):
         self.config = config
         self.vault_path = config.vault_path
@@ -984,7 +986,23 @@ class MigrationOrchestrator:
         self.uploader = NotionFileUploader(config.notion_token, config)
         self.block_builder = NotionBlockBuilder(self.uploader)
 
-        self.stats = {"directories": 0, "notes": 0, "files": 0, "errors": 0}
+        self.stats = {"directories": 0, "notes": 0, "files_referenced": 0, "files_orphaned": 0, "errors": 0}
+
+        # Track all files for complete accounting
+        self.all_vault_files = []  # All non-md files found in vault
+        self.referenced_files = set()  # Files referenced by markdown notes (resolved paths)
+        self.skipped_files = []  # Files in skipped directories
+        self.orphaned_files = []  # Files uploaded as orphans
+        self.dir_page_ids = {}  # Map directory paths to their Notion page IDs
+
+        # Generate unique report prefix based on input directory and timestamp
+        self.report_prefix = self._generate_report_prefix()
+
+    def _generate_report_prefix(self) -> str:
+        """Generate a unique prefix for report filenames."""
+        basename = self.vault_path.name
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        return f"{basename}-{timestamp}"
 
     def run(self):
         logger.info("=" * 60)
@@ -998,20 +1016,33 @@ class MigrationOrchestrator:
 
         logger.info("-" * 60)
 
-        # Migrate the source directory contents directly to the parent page
+        # Step 1: Scan all files in the vault first
+        self._scan_all_files()
+
+        logger.info("-" * 60)
+
+        # Step 2: Migrate the source directory contents directly to the parent page
+        # This also tracks which files are referenced by notes
+        self.dir_page_ids[str(self.vault_path)] = self.config.parent_page_id
         self._migrate_directory_contents(self.vault_path, self.config.parent_page_id, depth=0)
+
+        # Step 3: Upload orphaned files (files not referenced by any note)
+        logger.info("-" * 60)
+        self._upload_orphaned_files()
 
         logger.info("=" * 60)
         logger.info("Migration Complete!")
         logger.info("-" * 60)
-        logger.info(f"Directories:  {self.stats['directories']}")
-        logger.info(f"Notes:        {self.stats['notes']}")
-        logger.info(f"Files:        {self.stats['files']}")
+        logger.info(f"Directories:       {self.stats['directories']}")
+        logger.info(f"Notes:             {self.stats['notes']}")
+        logger.info(f"Files (referenced):{self.stats['files_referenced']}")
+        logger.info(f"Files (orphaned):  {self.stats['files_orphaned']}")
+        logger.info(f"Files (skipped):   {len(self.skipped_files)}")
         if self.stats['errors'] > 0:
-            logger.warning(f"Errors:       {self.stats['errors']}")
+            logger.warning(f"Errors:            {self.stats['errors']}")
         logger.info("=" * 60)
 
-        # Write report of failed files
+        # Write report of all files
         self._write_failure_report()
 
         return True
@@ -1029,7 +1060,7 @@ class MigrationOrchestrator:
         if not failed_uploads and not unresolved:
             return
 
-        report_path = Path("migration_failed_files.txt")
+        report_path = Path(f"{self.report_prefix}-failed_files.txt")
         with open(report_path, 'w') as f:
             f.write("=" * 60 + "\n")
             f.write("Obsidian to Notion Migration - Failed Files Report\n")
@@ -1058,60 +1089,145 @@ class MigrationOrchestrator:
 
     def _write_csv_report(self, successful: list, failed: list, unresolved: list):
         """Write a CSV report of all file upload statuses."""
-        csv_path = Path("migration_files_report.csv")
+        csv_path = Path(f"{self.report_prefix}-files_report.csv")
 
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
-                'file_path', 'file_name', 'status', 'notion_page_id',
+                'file_path', 'file_name', 'status', 'category', 'notion_page_id',
                 'notion_file_id', 'error_reason', 'referenced_from'
             ])
 
-            # Successful uploads
+            # Successful uploads (referenced files)
             for item in successful:
                 writer.writerow([
                     item['file'],
                     item['name'],
                     'uploaded',
+                    'referenced',
                     item.get('parent_page_id', ''),
                     item.get('file_upload_id', ''),
                     '',
                     ''
                 ])
 
-            # Failed uploads
+            # Failed uploads (referenced files)
             for item in failed:
                 writer.writerow([
                     item['file'],
                     item['name'],
                     'upload_failed',
+                    'referenced',
                     '',
                     '',
                     item.get('reason', 'Unknown'),
                     ''
                 ])
 
-            # Unresolved references
+            # Orphaned files
+            for item in self.orphaned_files:
+                writer.writerow([
+                    item['file'],
+                    item['name'],
+                    item.get('status', 'unknown'),
+                    'orphaned',
+                    item.get('parent_page_id', ''),
+                    '',
+                    item.get('parent_dir', ''),
+                    ''
+                ])
+
+            # Skipped files (in .obsidian, .git, .trash, hidden files)
+            for item in self.skipped_files:
+                writer.writerow([
+                    item['file'],
+                    item['name'],
+                    'skipped',
+                    'skipped',
+                    '',
+                    '',
+                    item.get('reason', ''),
+                    ''
+                ])
+
+            # Unresolved references (referenced but file not found)
             for item in unresolved:
                 writer.writerow([
                     '',
                     item['reference'],
                     'not_found',
+                    'unresolved_reference',
                     '',
                     '',
                     'File not found in vault',
                     item.get('note', '')
                 ])
 
+        # Calculate totals for verification
+        total_files_in_vault = len(self.all_vault_files) + len(self.skipped_files)
+        total_in_report = len(successful) + len(failed) + len(self.orphaned_files) + len(self.skipped_files)
+
         logger.info(f"CSV report written to: {csv_path}")
-        logger.info(f"  - {len(successful)} successful uploads")
-        logger.info(f"  - {len(failed)} failed uploads")
+        logger.info(f"  - {len(successful)} referenced files uploaded")
+        logger.info(f"  - {len(failed)} referenced files failed")
+        logger.info(f"  - {len(self.orphaned_files)} orphaned files processed")
+        logger.info(f"  - {len(self.skipped_files)} files skipped")
         logger.info(f"  - {len(unresolved)} unresolved references")
+        logger.info("-" * 40)
+        logger.info(f"Total files found in vault: {total_files_in_vault}")
+        logger.info(f"Total files in report:      {total_in_report}")
 
     def _should_skip_dir(self, dir_path: Path) -> bool:
-        """Check if a directory should be skipped."""
+        """Check if a directory should be skipped entirely (not migrated)."""
         name = dir_path.name.lower()
-        return name.startswith('.') or name in self.SKIP_DIRS
+        return name.startswith('.') or name in self.SKIP_DIRS_REPORT
+
+    def _is_attachment_dir(self, dir_path: Path) -> bool:
+        """Check if a directory is an attachment folder (files processed but no page created)."""
+        return dir_path.name.lower() in self.ATTACHMENT_DIRS
+
+    def _scan_all_files(self):
+        """Scan the entire vault and categorize all non-markdown files."""
+        logger.info("Scanning vault for all files...")
+
+        for root, dirs, files in os.walk(self.vault_path):
+            root_path = Path(root)
+            rel_path = root_path.relative_to(self.vault_path)
+
+            # Check if we're in a skipped directory
+            in_skipped_dir = False
+            for part in rel_path.parts:
+                if part.lower() in self.SKIP_DIRS_REPORT or part.startswith('.'):
+                    in_skipped_dir = True
+                    break
+
+            for filename in files:
+                file_path = root_path / filename
+
+                # Skip markdown files (they're notes, not attachments)
+                if filename.lower().endswith('.md'):
+                    continue
+
+                # Skip hidden files
+                if filename.startswith('.'):
+                    self.skipped_files.append({
+                        'file': str(file_path),
+                        'name': filename,
+                        'reason': 'Hidden file'
+                    })
+                    continue
+
+                if in_skipped_dir:
+                    self.skipped_files.append({
+                        'file': str(file_path),
+                        'name': filename,
+                        'reason': f'In skipped directory'
+                    })
+                else:
+                    self.all_vault_files.append(file_path)
+
+        logger.info(f"Found {len(self.all_vault_files)} non-markdown files to process")
+        logger.info(f"Found {len(self.skipped_files)} files in skipped directories")
 
     def _get_folder_icon(self, name: str) -> str:
         """Get an appropriate icon for a folder name."""
@@ -1142,6 +1258,9 @@ class MigrationOrchestrator:
         dir_page_id = self.notion.create_page(parent_id, dir_path.name, icon=icon)
         self.stats["directories"] += 1
 
+        # Track the page ID for this directory (for orphan uploads later)
+        self.dir_page_ids[str(dir_path)] = dir_page_id
+
         # Recursively migrate contents
         self._migrate_directory_contents(dir_path, dir_page_id, depth + 1)
 
@@ -1158,10 +1277,14 @@ class MigrationOrchestrator:
 
             note_page_id = self.notion.create_page(parent_id, page_title, icon="📄")
 
+            # Track referenced files (resolved paths)
+            for original_ref, file_path, start, end in parsed.file_references:
+                self.referenced_files.add(str(file_path.resolve()))
+
             # Build blocks with page_id so files can be uploaded to this note's page
             blocks = self.block_builder.build_blocks(parsed, note_path.parent, note_page_id)
 
-            self.stats["files"] += len(parsed.file_references)
+            self.stats["files_referenced"] += len(parsed.file_references)
 
             if blocks:
                 self.notion.add_blocks(note_page_id, blocks)
@@ -1174,6 +1297,82 @@ class MigrationOrchestrator:
             if self.config.verbose:
                 import traceback
                 traceback.print_exc()
+
+    def _upload_orphaned_files(self):
+        """Upload files that weren't referenced by any markdown note."""
+        logger.info("Processing orphaned files...")
+
+        orphan_count = 0
+        for file_path in self.all_vault_files:
+            resolved_path = str(file_path.resolve())
+
+            # Skip if this file was referenced by a note
+            if resolved_path in self.referenced_files:
+                continue
+
+            orphan_count += 1
+
+            # Find the appropriate parent page for this file
+            # For files in 'files/' subdirectories, use the parent of 'files/'
+            parent_dir = file_path.parent
+            if self._is_attachment_dir(parent_dir):
+                parent_dir = parent_dir.parent
+
+            # Find the Notion page ID for this directory
+            parent_page_id = self._find_parent_page_id(parent_dir)
+
+            if not parent_page_id:
+                logger.warning(f"No parent page found for orphan: {file_path}")
+                self.orphaned_files.append({
+                    'file': str(file_path),
+                    'name': file_path.name,
+                    'status': 'no_parent_page',
+                    'parent_dir': str(parent_dir)
+                })
+                continue
+
+            # Upload the file
+            logger.info(f"  📎 Orphan: {file_path.name} -> {parent_dir.name}/")
+            file_info = self.uploader.upload_file(file_path, parent_page_id)
+
+            if file_info and file_info.get("file_upload_id"):
+                # Create a file block in the parent page
+                file_block = self.block_builder._file_block(file_info)
+                if file_block:
+                    self.notion.add_blocks(parent_page_id, [file_block])
+                    self.orphaned_files.append({
+                        'file': str(file_path),
+                        'name': file_path.name,
+                        'status': 'uploaded',
+                        'parent_page_id': parent_page_id
+                    })
+                    self.stats["files_orphaned"] += 1
+                else:
+                    self.orphaned_files.append({
+                        'file': str(file_path),
+                        'name': file_path.name,
+                        'status': 'block_failed',
+                        'parent_page_id': parent_page_id
+                    })
+            else:
+                self.orphaned_files.append({
+                    'file': str(file_path),
+                    'name': file_path.name,
+                    'status': 'upload_failed',
+                    'parent_page_id': parent_page_id
+                })
+
+        logger.info(f"Processed {orphan_count} orphaned files")
+
+    def _find_parent_page_id(self, dir_path: Path) -> Optional[str]:
+        """Find the Notion page ID for a directory, walking up if needed."""
+        current = dir_path
+        while current >= self.vault_path:
+            page_id = self.dir_page_ids.get(str(current))
+            if page_id:
+                return page_id
+            current = current.parent
+        return self.config.parent_page_id
 
 
 # =============================================================================
