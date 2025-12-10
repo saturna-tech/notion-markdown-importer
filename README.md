@@ -25,6 +25,12 @@ Author: Ryan Cabeen, ryan@saturnatech.com
 ### 1. Install
 
 ```bash
+pip install -r requirements.txt
+```
+
+Or manually:
+
+```bash
 pip install notion-client requests
 ```
 

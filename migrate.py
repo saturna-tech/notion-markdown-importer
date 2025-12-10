@@ -1015,9 +1015,11 @@ class MigrationOrchestrator:
 
         # Track all files for complete accounting
         self.all_vault_files = []  # All non-md files found in vault
+        self.all_markdown_files = []  # All markdown files found in vault
         self.referenced_files = set()  # Files referenced by markdown notes (resolved paths)
         self.skipped_files = []  # Files in skipped directories
         self.orphaned_files = []  # Files uploaded as orphans
+        self.processed_notes = []  # Track markdown file processing results
         self.dir_page_ids = {}  # Map directory paths to their Notion page IDs
         self.api_errors = []  # Track API errors for reporting
 
@@ -1139,6 +1141,19 @@ class MigrationOrchestrator:
                 'notion_file_id', 'error_reason', 'referenced_from'
             ])
 
+            # Markdown notes
+            for item in self.processed_notes:
+                writer.writerow([
+                    item['file'],
+                    item['name'],
+                    item['status'],
+                    'markdown',
+                    item.get('page_id', ''),
+                    '',
+                    item.get('error', ''),
+                    ''
+                ])
+
             # Successful uploads (referenced files)
             for item in successful:
                 writer.writerow([
@@ -1218,10 +1233,17 @@ class MigrationOrchestrator:
                 ])
 
         # Calculate totals for verification
-        total_files_in_vault = len(self.all_vault_files) + len(self.skipped_files)
-        total_in_report = len(successful) + len(failed) + len(self.orphaned_files) + len(self.skipped_files)
+        total_files_in_vault = len(self.all_vault_files) + len(self.all_markdown_files) + len(self.skipped_files)
+        total_in_report = (len(self.processed_notes) + len(successful) + len(failed) +
+                          len(self.orphaned_files) + len(self.skipped_files))
+
+        # Count markdown statuses
+        notes_migrated = sum(1 for n in self.processed_notes if n['status'] == 'migrated')
+        notes_failed = sum(1 for n in self.processed_notes if n['status'] in ('failed', 'content_failed'))
 
         logger.info(f"CSV report written to: {csv_path}")
+        logger.info(f"  - {notes_migrated} markdown files migrated")
+        logger.info(f"  - {notes_failed} markdown files failed")
         logger.info(f"  - {len(successful)} referenced files uploaded")
         logger.info(f"  - {len(failed)} referenced files failed")
         logger.info(f"  - {len(self.orphaned_files)} orphaned files processed")
@@ -1241,7 +1263,7 @@ class MigrationOrchestrator:
         return dir_path.name.lower() in self.ATTACHMENT_DIRS
 
     def _scan_all_files(self):
-        """Scan the entire vault and categorize all non-markdown files."""
+        """Scan the entire vault and categorize all files."""
         logger.info("Scanning vault for all files...")
 
         for root, dirs, files in os.walk(self.vault_path):
@@ -1258,8 +1280,10 @@ class MigrationOrchestrator:
             for filename in files:
                 file_path = root_path / filename
 
-                # Skip markdown files (they're notes, not attachments)
+                # Track markdown files separately
                 if filename.lower().endswith('.md'):
+                    if not in_skipped_dir and not filename.startswith('.'):
+                        self.all_markdown_files.append(file_path)
                     continue
 
                 # Skip hidden files
@@ -1275,11 +1299,12 @@ class MigrationOrchestrator:
                     self.skipped_files.append({
                         'file': str(file_path),
                         'name': filename,
-                        'reason': f'In skipped directory'
+                        'reason': 'In skipped directory'
                     })
                 else:
                     self.all_vault_files.append(file_path)
 
+        logger.info(f"Found {len(self.all_markdown_files)} markdown files to process")
         logger.info(f"Found {len(self.all_vault_files)} non-markdown files to process")
         logger.info(f"Found {len(self.skipped_files)} files in skipped directories")
 
@@ -1340,6 +1365,7 @@ class MigrationOrchestrator:
 
             self.stats["files_referenced"] += len(parsed.file_references)
 
+            content_failed = False
             if blocks:
                 if not self.notion.add_blocks(note_page_id, blocks):
                     logger.warning(f"{'  ' * depth}⚠️  Content partially failed for: {note_path.name}")
@@ -1351,12 +1377,30 @@ class MigrationOrchestrator:
                         'reason': 'Failed to add blocks after retries'
                     })
                     self.stats["api_errors"] += 1
+                    content_failed = True
+
+            # Track this note's processing result
+            self.processed_notes.append({
+                'file': str(note_path),
+                'name': note_path.name,
+                'status': 'content_failed' if content_failed else 'migrated',
+                'page_id': note_page_id,
+                'page_title': page_title
+            })
 
             self.stats["notes"] += 1
 
         except Exception as e:
             logger.error(f"{'  ' * depth}❌ Failed: {e}")
             self.stats["errors"] += 1
+            # Track failed note
+            self.processed_notes.append({
+                'file': str(note_path),
+                'name': note_path.name,
+                'status': 'failed',
+                'page_id': '',
+                'error': str(e)
+            })
             if self.config.verbose:
                 import traceback
                 traceback.print_exc()
