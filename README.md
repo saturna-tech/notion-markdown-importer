@@ -1,14 +1,13 @@
 # Markdown Import Tool for Notion
 
-Migrate your markdown workspace to Notion with page hierarchy and embedded
-files. For example, this could import an Obsidian Vault to Notion.
+Migrate your markdown workspace to Notion with page hierarchy and embedded files.
 
 Author: Ryan Cabeen, ryan@saturnatech.com
 
 ## Features
 
 - Preserves any folder structure as nested Notion pages
-- Parses Obsidian-flavored markdown
+- Parses markdown with wiki-style links (`[[link]]`) and embeds (`![[file]]`)
 - Uploads files directly to Notion via the file upload API
 - Embeds images, PDFs, videos, and audio inline in notes
 - **Uploads all files** - both referenced files and orphaned files are captured
@@ -18,6 +17,7 @@ Author: Ryan Cabeen, ryan@saturnatech.com
 - Configurable sort order (alphabetical or reverse)
 - Resilient to transient API errors (retries with backoff)
 - Comprehensive reporting for verification
+- Logs all output to timestamped log file
 - Dry-run mode to preview changes
 
 ## Quick Start
@@ -38,7 +38,7 @@ pip install notion-client requests
 
 1. Go to [notion.so/my-integrations](https://www.notion.so/my-integrations)
 2. Click **+ New integration**
-3. Name it (e.g., "Obsidian Migration")
+3. Name it (e.g., "Markdown Migration")
 4. Enable **Read content** capability (required for file uploads)
 5. Copy the **Internal Integration Token**
 
@@ -54,22 +54,22 @@ pip install notion-client requests
 export NOTION_TOKEN="secret_xxxxxxxxxx"
 
 # Run migration
-python migrate.py ~/Documents/MyVault "https://www.notion.so/myteam/Page-abc123"
+python run.py ~/Documents/Notes "https://www.notion.so/myteam/Page-abc123"
 ```
 
 Or pass token directly:
 
 ```bash
-python migrate.py ~/Documents/MyVault "https://notion.so/Page-abc123" --token secret_xxx
+python run.py ~/Documents/Notes "https://notion.so/Page-abc123" --token secret_xxx
 ```
 
 ## Usage
 
 ```
-python migrate.py SOURCE DESTINATION [OPTIONS]
+python run.py SOURCE DESTINATION [OPTIONS]
 
 Arguments:
-  SOURCE        Path to Obsidian vault or any directory to migrate
+  SOURCE        Path to markdown directory to migrate
   DESTINATION   Notion page URL where content will be created
 
 Options:
@@ -83,23 +83,23 @@ Options:
 ## Examples
 
 ```bash
-# Migrate entire vault
-python migrate.py ~/Obsidian/MyVault "https://notion.so/myteam/abc123"
+# Migrate entire directory
+python run.py ~/Notes "https://notion.so/myteam/abc123"
 
 # Migrate just a subfolder
-python migrate.py ~/Obsidian/MyVault/Projects "https://notion.so/abc123"
+python run.py ~/Notes/Projects "https://notion.so/abc123"
 
 # Preview what will happen
-python migrate.py ~/Obsidian/Work "https://notion.so/myteam/abc123" --dry-run
+python run.py ~/Notes/Work "https://notion.so/myteam/abc123" --dry-run
 
 # Reverse sort (newest/last items first - useful for journals)
-python migrate.py ~/Obsidian "https://notion.so/abc123" --reverse-sort
+python run.py ~/Notes "https://notion.so/abc123" --reverse-sort
 
 # Skip file uploads (faster, notes only)
-python migrate.py ~/Obsidian "https://notion.so/abc123" --skip-files
+python run.py ~/Notes "https://notion.so/abc123" --skip-files
 
 # Verbose output for debugging
-python migrate.py ~/Obsidian "https://notion.so/abc123" -v
+python run.py ~/Notes "https://notion.so/abc123" -v
 ```
 
 ## Directory Structure
@@ -119,7 +119,7 @@ AnyFolder/
 └── README.md
 ```
 
-**Skipped directories:** `.obsidian/`, `.git/`, `.trash/`, and any hidden folders (starting with `.`)
+**Skipped directories:** `.git/`, `.trash/`, and any hidden folders (starting with `.`)
 
 **Attachment directories:** `files/` folders are scanned for files but not created as pages
 
@@ -142,19 +142,19 @@ Folders get contextual icons based on name (📓 Journal, 📋 Areas, 📚 Resou
 
 ### All Files Are Captured
 
-The script ensures **every file** in your vault is accounted for:
+The script ensures **every file** in your directory is accounted for:
 
 1. **Referenced files**: Files embedded in markdown notes are uploaded to that note's page
 2. **Orphaned files**: Files not referenced by any note are uploaded to their parent directory's page
-3. **Skipped files**: Files in `.obsidian/`, `.git/`, etc. are tracked in the report but not uploaded
+3. **Skipped files**: Files in `.git/`, etc. are tracked in the report but not uploaded
 
-This guarantees you can safely dispose of the original vault after verifying the migration report.
+This guarantees you can safely dispose of the original directory after verifying the migration report.
 
 ### Supported Embed Syntax
 
 | Syntax | Example |
 |--------|---------|
-| Obsidian embed | `![[diagram.png]]` |
+| Wiki-style embed | `![[diagram.png]]` |
 | Markdown image | `![alt](path/to/image.png)` |
 | Markdown file link | `[Document](path/to/file.pdf)` |
 
@@ -164,7 +164,7 @@ When looking for a referenced file:
 
 1. `files/` subdirectory next to the note
 2. Same directory as the note
-3. Vault root
+3. Directory root
 4. **Fallback:** Search entire directory tree for matching filename
 
 URL-encoded paths (e.g., `path%20with%20spaces`) are automatically decoded.
@@ -191,7 +191,7 @@ URL-encoded paths (e.g., `path%20with%20spaces`) are automatically decoded.
 
 ## Markdown Support
 
-| Obsidian | Notion |
+| Markdown | Notion |
 |----------|--------|
 | `# Heading` | Heading 1 |
 | `## Heading` | Heading 2 |
@@ -213,7 +213,11 @@ URL-encoded paths (e.g., `path%20with%20spaces`) are automatically decoded.
 
 After migration, the script generates timestamped reports:
 
-### `{vault}-{timestamp}-files_report.csv`
+### `{directory}-{timestamp}-log.txt`
+
+Full console output saved to a log file for review.
+
+### `{directory}-{timestamp}-files_report.csv`
 
 CSV with every file's status:
 
@@ -222,17 +226,17 @@ CSV with every file's status:
 | `file_path` | Full path to source file |
 | `file_name` | Filename |
 | `status` | `uploaded`, `upload_failed`, `skipped`, `api_error`, or `not_found` |
-| `category` | `referenced`, `orphaned`, `skipped`, or `unresolved_reference` |
+| `category` | `markdown`, `referenced`, `orphaned`, `skipped`, or `unresolved_reference` |
 | `notion_page_id` | Notion page where file was uploaded |
 | `notion_file_id` | Notion file upload ID |
 | `error_reason` | Why it failed (if applicable) |
 | `referenced_from` | Which note referenced it |
 
 The report includes totals for verification:
-- Total files found in vault
+- Total files found in directory
 - Total files in report (should match)
 
-### `{vault}-{timestamp}-failed_files.txt`
+### `{directory}-{timestamp}-failed_files.txt`
 
 Human-readable report of failures (only created if there were issues):
 
@@ -272,7 +276,7 @@ Some URLs in your notes may be malformed. Run with `-v` to see which URLs are be
 - Verify the file exists and the path/filename matches
 
 ### Rate limiting
-The script includes delays between API calls. For very large vaults, you may need to run in batches.
+The script includes delays between API calls. For very large directories, you may need to run in batches.
 
 ### 502/503 errors
 These are transient Notion API errors. The script retries automatically. If they persist, wait and try again later.
@@ -282,8 +286,6 @@ These are transient Notion API errors. The script retries automatically. If they
 ### Not Supported
 
 - **Internal links:** `[[Note Name]]` becomes plain text (Notion API doesn't support creating cross-page links)
-- **Dataview queries:** Not converted (use Notion databases instead)
-- **Obsidian plugins:** Plugin-specific syntax won't transfer
 - **Nested bullet points:** Flattened to single level
 - **Tables:** Not currently converted to Notion tables
 

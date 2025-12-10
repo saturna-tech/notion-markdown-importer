@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Obsidian to Notion Migration Script
+Markdown to Notion Migration Script
 ====================================
-Migrates Obsidian markdown files to Notion, preserving directory hierarchy
+Migrates markdown files to Notion, preserving directory hierarchy
 and embedded file references.
 
 The script recursively processes any directory structure:
 - Directories become Notion pages
 - Markdown files become child pages with content
 - Embedded files (images, PDFs, etc.) are uploaded to the note that references them
-- Special directories (files/, .obsidian/, .git/) are automatically skipped
+- Special directories (files/, .git/) are automatically skipped
 
 Usage:
-    python migrate.py /path/to/vault "https://www.notion.so/teamspace/Page-abc123"
-    python migrate.py /path/to/vault/Projects "https://www.notion.so/teamspace/Page-abc123"
+    python run.py /path/to/notes "https://www.notion.so/teamspace/Page-abc123"
+    python run.py /path/to/notes/Projects "https://www.notion.so/teamspace/Page-abc123"
 
 Requirements:
     pip install notion-client requests
@@ -44,12 +44,39 @@ from urllib.parse import urlparse, quote, unquote
 from notion_client import Client as NotionClient
 from notion_client.errors import APIResponseError, HTTPResponseError
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Configure logging - will be set up properly in setup_logging()
 logger = logging.getLogger(__name__)
+
+
+def setup_logging(log_prefix: str, verbose: bool = False):
+    """Configure logging to both console and file."""
+    log_level = logging.DEBUG if verbose else logging.INFO
+    log_format = '%(asctime)s - %(levelname)s - %(message)s'
+
+    # Create formatters
+    formatter = logging.Formatter(log_format)
+
+    # Set up root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+
+    # Clear any existing handlers
+    root_logger.handlers = []
+
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+
+    # File handler
+    log_file = Path(f"{log_prefix}-log.txt")
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+
+    return log_file
 
 
 # =============================================================================
@@ -59,28 +86,28 @@ logger = logging.getLogger(__name__)
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Migrate Obsidian vault to Notion",
+        description="Migrate markdown directory to Notion",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Migrate entire vault
-    python migrate.py ~/Documents/MyVault "https://www.notion.so/myteam/Page-abc123"
+    # Migrate entire directory
+    python run.py ~/Documents/Notes "https://www.notion.so/myteam/Page-abc123"
 
     # Migrate a specific subfolder
-    python migrate.py ~/Documents/MyVault/Projects "https://www.notion.so/myteam/Projects-abc123"
+    python run.py ~/Documents/Notes/Projects "https://www.notion.so/myteam/Projects-abc123"
 
     # With token flag
-    python migrate.py ~/Documents/MyVault "https://www.notion.so/myteam/Page-abc123" --token secret_xxx
+    python run.py ~/Documents/Notes "https://www.notion.so/myteam/Page-abc123" --token secret_xxx
 
     # Dry run to preview
-    python migrate.py ~/Documents/MyVault "https://www.notion.so/myteam/Page-abc123" --dry-run
+    python run.py ~/Documents/Notes "https://www.notion.so/myteam/Page-abc123" --dry-run
         """
     )
-    
+
     parser.add_argument(
         "source",
         type=str,
-        help="Path to Obsidian vault directory"
+        help="Path to markdown directory"
     )
     
     parser.add_argument(
@@ -321,12 +348,12 @@ class NotionFileUploader:
 
 
 # =============================================================================
-# Markdown Parser (Obsidian-flavored)
+# Markdown Parser
 # =============================================================================
 
 @dataclass
 class ParsedNote:
-    """Represents a parsed Obsidian note."""
+    """Represents a parsed markdown note."""
     title: str
     date: Optional[datetime] = None
     content: str = ""
@@ -335,8 +362,8 @@ class ParsedNote:
     internal_links: list = field(default_factory=list)
 
 
-class ObsidianParser:
-    """Parses Obsidian markdown files."""
+class MarkdownParser:
+    """Parses markdown files."""
 
     FRONTMATTER_PATTERN = re.compile(r'^---\s*\n(.*?)\n---\s*\n', re.DOTALL)
     WIKILINK_PATTERN = re.compile(r'\[\[([^\]|]+)(?:\|([^\]]+))?\]\]')
@@ -361,7 +388,7 @@ class ObsidianParser:
         self.unresolved_references = []  # Track unresolved file references
     
     def parse_file(self, file_path: Path) -> ParsedNote:
-        """Parse an Obsidian markdown file."""
+        """Parse a markdown file."""
         content = file_path.read_text(encoding='utf-8')
         
         title = file_path.stem
@@ -413,7 +440,7 @@ class ObsidianParser:
         # Track positions we've already matched to avoid duplicates
         matched_positions = set()
 
-        # Obsidian embeds: ![[filename]]
+        # Wiki-style embeds: ![[filename]]
         for match in self.EMBED_PATTERN.finditer(content):
             ref = match.group(1)
             file_path = self._resolve_file_path(ref, note_dir, files_dir, note_path)
@@ -579,7 +606,7 @@ class NotionBlockBuilder:
 
         try:
             response = requests.get(url, timeout=5, headers={
-                'User-Agent': 'Mozilla/5.0 (compatible; ObsidianMigrator/1.0)'
+                'User-Agent': 'Mozilla/5.0 (compatible; NotionMigrator/1.0)'
             })
             if response.status_code == 200:
                 # Look for <title> tag
@@ -998,16 +1025,17 @@ class MigrationOrchestrator:
     }
 
     # Directories to skip entirely (not migrated, but tracked in report)
-    SKIP_DIRS_REPORT = {'.obsidian', '.trash', '.git'}
+    SKIP_DIRS_REPORT = {'.trash', '.git'}
     # Directories that contain attachments (not created as pages, but files are processed)
     ATTACHMENT_DIRS = {'files'}
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, report_prefix: str):
         self.config = config
         self.vault_path = config.vault_path
+        self.report_prefix = report_prefix
 
         self.notion = NotionMigrator(config)
-        self.parser = ObsidianParser(self.vault_path)
+        self.parser = MarkdownParser(self.vault_path)
         self.uploader = NotionFileUploader(config.notion_token, config)
         self.block_builder = NotionBlockBuilder(self.uploader)
 
@@ -1023,18 +1051,9 @@ class MigrationOrchestrator:
         self.dir_page_ids = {}  # Map directory paths to their Notion page IDs
         self.api_errors = []  # Track API errors for reporting
 
-        # Generate unique report prefix based on input directory and timestamp
-        self.report_prefix = self._generate_report_prefix()
-
-    def _generate_report_prefix(self) -> str:
-        """Generate a unique prefix for report filenames."""
-        basename = self.vault_path.name
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        return f"{basename}-{timestamp}"
-
     def run(self):
         logger.info("=" * 60)
-        logger.info("Obsidian to Notion Migration")
+        logger.info("Markdown to Notion Migration")
         logger.info("=" * 60)
         logger.info(f"Source: {self.vault_path}")
         logger.info(f"Destination page: {self.config.parent_page_id}")
@@ -1093,7 +1112,7 @@ class MigrationOrchestrator:
         report_path = Path(f"{self.report_prefix}-failed_files.txt")
         with open(report_path, 'w') as f:
             f.write("=" * 60 + "\n")
-            f.write("Obsidian to Notion Migration - Failed Files Report\n")
+            f.write("Markdown to Notion Migration - Failed Files Report\n")
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("=" * 60 + "\n\n")
 
@@ -1193,7 +1212,7 @@ class MigrationOrchestrator:
                     ''
                 ])
 
-            # Skipped files (in .obsidian, .git, .trash, hidden files)
+            # Skipped files (in .git, .trash, hidden files)
             for item in self.skipped_files:
                 writer.writerow([
                     item['file'],
@@ -1495,30 +1514,33 @@ class MigrationOrchestrator:
 
 def main():
     args = parse_args()
-    
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
+
     source_path = Path(args.source).expanduser().resolve()
     if not source_path.exists():
-        logger.error(f"Source path does not exist: {source_path}")
+        print(f"Error: Source path does not exist: {source_path}")
         sys.exit(1)
-    
+
     if not source_path.is_dir():
-        logger.error(f"Source path is not a directory: {source_path}")
+        print(f"Error: Source path is not a directory: {source_path}")
         sys.exit(1)
-    
+
+    # Generate log prefix and set up logging
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_prefix = f"{source_path.name}-{timestamp}"
+    log_file = setup_logging(log_prefix, args.verbose)
+    logger.info(f"Log file: {log_file}")
+
     if not args.token:
         logger.error("Notion token required. Set NOTION_TOKEN env var or use --token flag")
         logger.info("Get your token at: https://www.notion.so/my-integrations")
         sys.exit(1)
-    
+
     try:
         parent_page_id = extract_page_id(args.destination)
     except ValueError as e:
         logger.error(str(e))
         sys.exit(1)
-    
+
     config = Config(
         vault_path=source_path,
         notion_token=args.token,
@@ -1528,10 +1550,11 @@ def main():
         verbose=args.verbose,
         reverse_sort=args.reverse_sort
     )
-    
-    orchestrator = MigrationOrchestrator(config)
+
+    orchestrator = MigrationOrchestrator(config, log_prefix)
     success = orchestrator.run()
-    
+
+    logger.info(f"Full log saved to: {log_file}")
     sys.exit(0 if success else 1)
 
 
